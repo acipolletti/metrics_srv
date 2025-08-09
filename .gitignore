@@ -1,0 +1,14 @@
+# File compilati
+build/
+*.o
+*.so
+*.exe
+
+# File di certificati e chiavi (per sicurezza)
+*.key
+*.crt
+*.csr
+
+# File temporanei
+*.tmp
+*.log
