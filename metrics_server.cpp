@@ -1,963 +1,505 @@
-// metrics_server.cpp
-// Server REST in C++20 per acquisizione metriche da Telegraf con TLS
-
 #include <iostream>
+#include <fstream>
 #include <string>
-#include <vector>
-#include <map>
-#include <memory>
-#include <chrono>
 #include <thread>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+#include <memory>
+#include <queue>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
-#include <fstream>
-#include <sstream>
-#include <iomanip>
-#include <ctime>
-#include <algorithm>
-#include <numeric>
-#include <set>
 #include <atomic>
+#include <vector>
 
-// Librerie esterne necessarie (da installare)
-#include <httplib.h> // cpp-httplib: https://github.com/yhirose/cpp-httplib
-#include <nlohmann/json.hpp> // nlohmann/json: https://github.com/nlohmann/json
-
-// OpenSSL headers per validazione certificati
-#include <openssl/x509.h>
-#include <openssl/x509_vfy.h>
-#include <openssl/pem.h>
+// Include per il server HTTP
+#include <httplib.h>  // cpp-httplib
+#include <nlohmann/json.hpp>
+#include "TelegrafToRedisTS.hpp"
 
 using json = nlohmann::json;
-using namespace std::chrono_literals;
+using namespace std;
+using namespace std::chrono;
 
-// Struttura per rappresentare una metrica
-struct Metric {
-    std::string name;
-    std::map<std::string, std::string> tags;
-    std::map<std::string, double> fields;
-    std::chrono::system_clock::time_point timestamp;
+class MetricsServer {
+private:
+    httplib::Server server;
+    httplib::SSLServer ssl_server;
     
-    json to_json() const {
-        json j;
-        j["name"] = name;
-        j["tags"] = tags;
-        j["fields"] = fields;
-        j["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-            timestamp.time_since_epoch()).count();
-        return j;
-    }
+    // Struttura per un elemento della queue
+    struct QueueItem {
+        string raw_data;        // Body HTTP raw (non parsato)
+        string source_ip;       // IP del client
+        steady_clock::time_point received_time;  // Timestamp ricezione
+    };
     
-    static Metric from_json(const json& j) {
-        Metric m;
-        m.name = j["name"];
-        m.tags = j["tags"].get<std::map<std::string, std::string>>();
-        m.fields = j["fields"].get<std::map<std::string, double>>();
-        
-        if (j.contains("timestamp")) {
-            auto ms = std::chrono::milliseconds(j["timestamp"].get<long long>());
-            m.timestamp = std::chrono::system_clock::time_point(ms);
-        } else {
-            m.timestamp = std::chrono::system_clock::now();
-        }
-        
-        return m;
-    }
-};
+    // Queue asincrona per processamento - contiene STRING non JSON!
+    queue<QueueItem> metricsQueue;
+    mutex queueMutex;
+    condition_variable queueCV;
+    atomic<bool> shouldStop{false};
+    
+    // Statistiche dettagliate
+    atomic<size_t> total_requests_received{0};
+    atomic<size_t> total_metrics_received{0};
+    atomic<size_t> total_metrics_processed{0};
+    atomic<size_t> total_parse_errors{0};
+    atomic<size_t> metrics_in_queue{0};
+    atomic<size_t> total_processing_time_ms{0};
+    atomic<size_t> max_queue_size{0};
+    
+    // Configurazione Redis
+    vector<unique_ptr<RedisTimeSeriesGenerator>> generators;  // Un generator per thread
+    RedisTimeSeriesGenerator::Config config;
+    
+    // Thread pool per processamento
+    vector<thread> processingThreads;
+    static constexpr size_t NUM_WORKERS = 8;  // Aumentato per migliore parallelismo
+    static constexpr size_t QUEUE_WARNING_THRESHOLD = 10000;
+    static constexpr size_t QUEUE_MAX_SIZE = 100000;  // Limite massimo queue
+    
+    // File logging (opzionale)
+    ofstream metrics_file;
+    mutex file_mutex;
+    bool enableFileLogging = true;
+    
+    // Metriche di performance per thread
+    struct ThreadMetrics {
+        atomic<size_t> items_processed{0};
+        atomic<size_t> parse_errors{0};
+        atomic<size_t> total_time_ms{0};
+    };
+    vector<ThreadMetrics> threadMetrics;
 
-// Gestione client per streaming real-time
-class StreamingClient {
 public:
-    using MetricCallback = std::function<void(const Metric&)>;
-    
-private:
-    std::string id_;
-    MetricCallback callback_;
-    std::set<std::string> filters_; // Filtri per nome metrica
-    std::map<std::string, std::string> tag_filters_; // Filtri per tags
-    
-public:
-    StreamingClient(const std::string& id, MetricCallback callback) 
-        : id_(id), callback_(callback) {}
-    
-    void set_filters(const std::set<std::string>& metric_names) {
-        filters_ = metric_names;
-    }
-    
-    void set_tag_filters(const std::map<std::string, std::string>& tags) {
-        tag_filters_ = tags;
-    }
-    
-    bool should_receive(const Metric& metric) const {
-        // Se non ci sono filtri, ricevi tutto
-        if (filters_.empty() && tag_filters_.empty()) return true;
+    MetricsServer(const string& cert_file, const string& key_file) 
+        : ssl_server(cert_file.c_str(), key_file.c_str()),
+          threadMetrics(NUM_WORKERS) {
         
-        // Verifica filtro nome
-        if (!filters_.empty() && filters_.find(metric.name) == filters_.end()) {
-            return false;
+        // Configura il generatore Redis
+        config.createTimeSeries = true;
+        config.useMultiAdd = true;  // Batch processing
+        config.retention = 86400;
+        config.keyPrefix = "metrics";
+        config.duplicatePolicyValue = "LAST";
+        
+        // Crea un generator per ogni worker thread (evita contention)
+        for (size_t i = 0; i < NUM_WORKERS; ++i) {
+            generators.push_back(make_unique<RedisTimeSeriesGenerator>(config));
         }
         
-        // Verifica filtri tag
-        for (const auto& [key, value] : tag_filters_) {
-            auto it = metric.tags.find(key);
-            if (it == metric.tags.end() || it->second != value) {
-                return false;
+        // Apri file per logging solo se abilitato
+        if (enableFileLogging) {
+            metrics_file.open("metrics.jsonl", ios::app);
+        }
+        
+        // Setup dei route
+        setupRoutes(server);
+        setupRoutes(ssl_server);
+        
+        // Avvia i thread di processamento
+        startProcessingThreads();
+        
+        cout << "=== Metrics Server Initialized ===" << endl;
+        cout << "Worker threads: " << NUM_WORKERS << endl;
+        cout << "Queue max size: " << QUEUE_MAX_SIZE << endl;
+        cout << "File logging: " << (enableFileLogging ? "enabled" : "disabled") << endl;
+    }
+    
+    ~MetricsServer() {
+        cout << "Shutting down metrics server..." << endl;
+        
+        // Ferma i thread di processamento
+        shouldStop = true;
+        queueCV.notify_all();
+        
+        for (auto& t : processingThreads) {
+            if (t.joinable()) {
+                t.join();
             }
         }
         
-        return true;
-    }
-    
-    void send_metric(const Metric& metric) {
-        if (should_receive(metric) && callback_) {
-            callback_(metric);
-        }
-    }
-    
-    const std::string& id() const { return id_; }
-};
-
-// Storage thread-safe per le metriche con supporto streaming
-class MetricsStorage {
-private:
-    mutable std::mutex mutex_;
-    std::vector<Metric> metrics_;
-    size_t max_metrics_ = 10000; // Limite massimo di metriche in memoria
-    
-    // Gestione streaming clients
-    mutable std::mutex streaming_mutex_;
-    std::map<std::string, std::shared_ptr<StreamingClient>> streaming_clients_;
-    
-public:
-    void add_metric(const Metric& metric) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            metrics_.push_back(metric);
-            
-            // Rimuovi le metriche più vecchie se superiamo il limite
-            if (metrics_.size() > max_metrics_) {
-                metrics_.erase(metrics_.begin(), metrics_.begin() + (metrics_.size() - max_metrics_));
-            }
+        // Processa eventuali metriche rimanenti nella queue
+        if (!metricsQueue.empty()) {
+            cout << "Warning: " << metricsQueue.size() << " items still in queue at shutdown" << endl;
         }
         
-        // Notifica i client streaming
-        notify_streaming_clients(metric);
-    }
-    
-    void add_metrics(const std::vector<Metric>& metrics) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            metrics_.insert(metrics_.end(), metrics.begin(), metrics.end());
-            
-            if (metrics_.size() > max_metrics_) {
-                metrics_.erase(metrics_.begin(), metrics_.begin() + (metrics_.size() - max_metrics_));
-            }
+        if (metrics_file.is_open()) {
+            metrics_file.close();
         }
         
-        // Notifica i client streaming per ogni metrica
-        for (const auto& metric : metrics) {
-            notify_streaming_clients(metric);
-        }
+        // Stampa statistiche finali
+        printFinalStats();
     }
     
-    std::vector<Metric> get_metrics(const std::string& name = "", 
-                                   const std::map<std::string, std::string>& tags = {},
-                                   size_t limit = 1000) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<Metric> result;
+    template<typename ServerType>
+    void setupRoutes(ServerType& srv) {
+        // Configura il server per migliori performance
+        srv.set_keep_alive_max_count(1000);
+        srv.set_keep_alive_timeout(5);
+        srv.set_read_timeout(5, 0);
+        srv.set_write_timeout(5, 0);
+        srv.set_payload_max_length(100 * 1024 * 1024); // 100MB max
         
-        for (const auto& metric : metrics_) {
-            bool match = true;
-            
-            // Filtra per nome se specificato
-            if (!name.empty() && metric.name != name) {
-                match = false;
-            }
-            
-            // Filtra per tags se specificati
-            for (const auto& [key, value] : tags) {
-                auto it = metric.tags.find(key);
-                if (it == metric.tags.end() || it->second != value) {
-                    match = false;
-                    break;
-                }
-            }
-            
-            if (match) {
-                result.push_back(metric);
-                if (result.size() >= limit) break;
-            }
-        }
-        
-        return result;
-    }
-    
-    void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        metrics_.clear();
-    }
-    
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return metrics_.size();
-    }
-    
-    // Calcola statistiche per una metrica specifica
-    json get_statistics(const std::string& metric_name, const std::string& field_name) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<double> values;
-        
-        for (const auto& metric : metrics_) {
-            if (metric.name == metric_name) {
-                auto it = metric.fields.find(field_name);
-                if (it != metric.fields.end()) {
-                    values.push_back(it->second);
-                }
-            }
-        }
-        
-        json stats;
-        if (!values.empty()) {
-            std::sort(values.begin(), values.end());
-            
-            double sum = std::accumulate(values.begin(), values.end(), 0.0);
-            double mean = sum / values.size();
-            
-            double sq_sum = std::inner_product(values.begin(), values.end(), values.begin(), 0.0);
-            double stdev = std::sqrt(sq_sum / values.size() - mean * mean);
-            
-            stats["count"] = values.size();
-            stats["min"] = values.front();
-            stats["max"] = values.back();
-            stats["mean"] = mean;
-            stats["median"] = values[values.size() / 2];
-            stats["stddev"] = stdev;
-            stats["sum"] = sum;
-        }
-        
-        return stats;
-    }
-    
-    // Metodi per gestione streaming
-    std::string add_streaming_client(StreamingClient::MetricCallback callback) {
-        std::lock_guard<std::mutex> lock(streaming_mutex_);
-        
-        // Genera ID univoco
-        auto now = std::chrono::system_clock::now();
-        auto id = "client_" + std::to_string(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                now.time_since_epoch()).count());
-        
-        streaming_clients_[id] = std::make_shared<StreamingClient>(id, callback);
-        return id;
-    }
-    
-    void remove_streaming_client(const std::string& client_id) {
-        std::lock_guard<std::mutex> lock(streaming_mutex_);
-        streaming_clients_.erase(client_id);
-    }
-    
-    void set_client_filters(const std::string& client_id, 
-                          const std::set<std::string>& metric_names,
-                          const std::map<std::string, std::string>& tags = {}) {
-        std::lock_guard<std::mutex> lock(streaming_mutex_);
-        auto it = streaming_clients_.find(client_id);
-        if (it != streaming_clients_.end()) {
-            it->second->set_filters(metric_names);
-            it->second->set_tag_filters(tags);
-        }
-    }
-    
-private:
-    void notify_streaming_clients(const Metric& metric) {
-        std::lock_guard<std::mutex> lock(streaming_mutex_);
-        for (const auto& [id, client] : streaming_clients_) {
-            // Notifica in modo asincrono per non bloccare
-            std::thread([client, metric]() {
-                client->send_metric(metric);
-            }).detach();
-        }
-    }
-};
-
-// Configurazione del server
-struct ServerConfig {
-    std::string host = "0.0.0.0";
-    int port = 8443;
-    std::string cert_file = "server.crt";
-    std::string key_file = "server.key";
-    std::string ca_file = "ca.crt"; // Per autenticazione client
-    bool require_client_cert = true;
-    std::string api_key = ""; // API key opzionale per autenticazione aggiuntiva
-    bool enable_compression = true; // Abilita compressione gzip
-    int compression_level = 6; // Livello compressione (1-9)
-};
-
-// Server REST per metriche
-class MetricsRESTServer {
-private:
-    ServerConfig config_;
-    std::unique_ptr<httplib::SSLServer> server_;
-    MetricsStorage storage_;
-    std::thread server_thread_;
-    std::atomic<bool> running_{false};
-    X509* ca_cert_ = nullptr; // Certificato CA per validazione
-    
-    // Logger semplice
-    void log(const std::string& level, const std::string& message) {
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::cout << "[" << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S") 
-                  << "] [" << level << "] " << message << std::endl;
-    }
-    
-    // Carica certificato CA per validazione
-    bool load_ca_certificate() {
-        FILE* ca_file = fopen(config_.ca_file.c_str(), "r");
-        if (!ca_file) {
-            log("ERROR", "Failed to open CA file: " + config_.ca_file);
-            return false;
-        }
-        
-        ca_cert_ = PEM_read_X509(ca_file, nullptr, nullptr, nullptr);
-        fclose(ca_file);
-        
-        if (!ca_cert_) {
-            log("ERROR", "Failed to load CA certificate");
-            return false;
-        }
-        
-        return true;
-    }
-    
-    // Callback per validazione certificato client
-    static int verify_callback(int preverify_ok, X509_STORE_CTX* ctx) {
-        if (!preverify_ok) {
-            X509* cert = X509_STORE_CTX_get_current_cert(ctx);
-            int err = X509_STORE_CTX_get_error(ctx);
-            int depth = X509_STORE_CTX_get_error_depth(ctx);
-            
-            char subject[256];
-            X509_NAME_oneline(X509_get_subject_name(cert), subject, sizeof(subject));
-            
-            std::cerr << "Certificate verification failed at depth " << depth 
-                     << ": " << X509_verify_cert_error_string(err)
-                     << " for " << subject << std::endl;
-        }
-        
-        return preverify_ok;
-    }
-    
-    // Verifica autenticazione API key se configurata
-    bool verify_api_key(const httplib::Request& req) {
-        if (config_.api_key.empty()) return true;
-        
-        auto auth_header = req.get_header_value("Authorization");
-        if (auth_header.empty()) return false;
-        
-        // Supporta formato "Bearer <api_key>"
-        if (auth_header.find("Bearer ") == 0) {
-            return auth_header.substr(7) == config_.api_key;
-        }
-        
-        return auth_header == config_.api_key;
-    }
-    
-    // Middleware per logging e autenticazione
-    void setup_middleware() {
-        server_->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-            log("INFO", "Request: " + req.method + " " + req.path + " from " + req.remote_addr);
-            
-            // Verifica API key se configurata
-            if (!verify_api_key(req)) {
-                res.status = 401;
-                res.set_content(R"({"error": "Unauthorized"})", "application/json");
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            
-            return httplib::Server::HandlerResponse::Unhandled;
+        // Endpoint principale - ULTRA VELOCE, solo enqueue
+        srv.Post("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+            handleMetricsAsync(req, res);
         });
         
-        // GET /stream - Server-Sent Events per streaming real-time
-        server_->Get("/stream", [this](const httplib::Request& req, httplib::Response& res) {
-            log("INFO", "New SSE connection from " + req.remote_addr);
-            
-            // Imposta headers per SSE
-            res.set_header("Content-Type", "text/event-stream");
-            res.set_header("Cache-Control", "no-cache");
-            res.set_header("Connection", "keep-alive");
-            res.set_header("X-Accel-Buffering", "no"); // Disabilita buffering proxy
-            
-            // Estrai filtri dalla query string
-            std::set<std::string> metric_filters;
-            std::map<std::string, std::string> tag_filters;
-            
-            if (req.has_param("metrics")) {
-                std::string metrics_param = req.get_param_value("metrics");
-                std::stringstream ss(metrics_param);
-                std::string metric;
-                while (std::getline(ss, metric, ',')) {
-                    metric_filters.insert(metric);
-                }
+        // Health check con metriche dettagliate
+        srv.Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
+            auto queue_size = metrics_in_queue.load();
+            string status = "healthy";
+            if (queue_size > QUEUE_WARNING_THRESHOLD) {
+                status = "warning";
             }
-            
-            for (const auto& [key, value] : req.params) {
-                if (key.find("tag.") == 0) {
-                    tag_filters[key.substr(4)] = value;
-                }
-            }
-            
-            // Configurazione del content provider per streaming
-            res.set_content_provider(
-                "text/event-stream",
-                [this, metric_filters, tag_filters](size_t offset, httplib::DataSink& sink) {
-                    std::atomic<bool> client_connected{true};
-                    std::condition_variable cv;
-                    std::mutex cv_mutex;
-                    std::queue<std::string> message_queue;
-                    
-                    // Registra client per ricevere metriche
-                    auto client_id = storage_.add_streaming_client(
-                        [&message_queue, &cv, &cv_mutex](const Metric& metric) {
-                            std::lock_guard<std::mutex> lock(cv_mutex);
-                            
-                            // Formatta metrica come evento SSE
-                            std::stringstream event;
-                            event << "event: metric\n";
-                            event << "data: " << metric.to_json().dump() << "\n\n";
-                            
-                            message_queue.push(event.str());
-                            cv.notify_one();
-                        }
-                    );
-                    
-                    // Imposta filtri per il client
-                    storage_.set_client_filters(client_id, metric_filters, tag_filters);
-                    
-                    // Invia heartbeat iniziale
-                    sink.write(":ok\n\n", 5);
-                    
-                    // Thread per inviare heartbeat periodici
-                    std::thread heartbeat_thread([&sink, &client_connected]() {
-                        while (client_connected) {
-                            std::this_thread::sleep_for(30s);
-                            if (client_connected && !sink.write(":heartbeat\n\n", 13)) {
-                                client_connected = false;
-                                break;
-                            }
-                        }
-                    });
-                    
-                    // Loop principale per inviare metriche
-                    while (client_connected) {
-                        std::unique_lock<std::mutex> lock(cv_mutex);
-                        
-                        // Attendi nuove metriche o timeout
-                        if (cv.wait_for(lock, 5s, [&message_queue]() { 
-                            return !message_queue.empty(); 
-                        })) {
-                            // Invia tutte le metriche in coda
-                            while (!message_queue.empty() && client_connected) {
-                                const auto& message = message_queue.front();
-                                if (!sink.write(message.c_str(), message.length())) {
-                                    client_connected = false;
-                                    break;
-                                }
-                                message_queue.pop();
-                            }
-                        }
-                    }
-                    
-                    // Cleanup
-                    client_connected = false;
-                    heartbeat_thread.join();
-                    storage_.remove_streaming_client(client_id);
-                    
-                    log("INFO", "SSE connection closed");
-                    return true;
-                }
-            );
-        });
-        
-        // WebSocket endpoint alternativo usando long polling
-        // GET /ws/metrics - Simula WebSocket con long polling
-        server_->Get("/ws/metrics", [this](const httplib::Request& req, httplib::Response& res) {
-            static std::map<std::string, std::chrono::system_clock::time_point> last_fetch;
-            
-            std::string client_id = req.get_param_value("client_id");
-            if (client_id.empty()) {
-                client_id = "anon_" + std::to_string(
-                    std::chrono::system_clock::now().time_since_epoch().count());
-            }
-            
-            auto since = last_fetch[client_id];
-            last_fetch[client_id] = std::chrono::system_clock::now();
-            
-            // Ottieni metriche dal timestamp
-            std::vector<Metric> new_metrics;
-            auto all_metrics = storage_.get_metrics();
-            
-            for (const auto& metric : all_metrics) {
-                if (metric.timestamp > since) {
-                    new_metrics.push_back(metric);
-                }
+            if (queue_size > QUEUE_MAX_SIZE * 0.9) {
+                status = "critical";
             }
             
             json response = {
-                {"client_id", client_id},
-                {"metrics", json::array()}
-            };
-            
-            for (const auto& metric : new_metrics) {
-                response["metrics"].push_back(metric.to_json());
-            }
-            
-            res.set_content(response.dump(), "application/json");
-        });
-        
-        // CORS headers
-        server_->set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-        });
-    }
-    
-    // Setup degli endpoint REST
-    void setup_endpoints() {
-        // Health check
-        server_->Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
-            json response = {
-                {"status", "healthy"},
-                {"metrics_count", storage_.size()},
-                {"timestamp", std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()}
+                {"status", status},
+                {"timestamp", getCurrentTimestamp()},
+                {"queue_size", queue_size},
+                {"max_queue_size_seen", max_queue_size.load()},
+                {"total_requests", total_requests_received.load()},
+                {"total_metrics_processed", total_metrics_processed.load()},
+                {"workers", NUM_WORKERS}
             };
             res.set_content(response.dump(), "application/json");
         });
         
-        // POST /metrics - Ricevi metriche da Telegraf
-        server_->Post("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                json data = json::parse(req.body);
-                std::vector<Metric> metrics;
-                
-                // Supporta sia singola metrica che array di metriche
-                if (data.is_array()) {
-                    for (const auto& item : data) {
-                        metrics.push_back(Metric::from_json(item));
-                    }
-                } else {
-                    metrics.push_back(Metric::from_json(data));
-                }
-                
-                storage_.add_metrics(metrics);
-                
-                json response = {
-                    {"status", "success"},
-                    {"metrics_received", metrics.size()}
-                };
-                res.set_content(response.dump(), "application/json");
-                
-                log("INFO", "Received " + std::to_string(metrics.size()) + " metrics");
-                
-            } catch (const std::exception& e) {
-                json error = {
-                    {"error", "Invalid JSON"},
-                    {"message", e.what()}
-                };
-                res.status = 400;
-                res.set_content(error.dump(), "application/json");
-                log("ERROR", "Failed to parse metrics: " + std::string(e.what()));
+        // Statistiche dettagliate per thread
+        srv.Get("/metrics/stats", [this](const httplib::Request& req, httplib::Response& res) {
+            json thread_stats = json::array();
+            for (size_t i = 0; i < NUM_WORKERS; ++i) {
+                thread_stats.push_back({
+                    {"thread_id", i},
+                    {"items_processed", threadMetrics[i].items_processed.load()},
+                    {"parse_errors", threadMetrics[i].parse_errors.load()},
+                    {"avg_time_ms", threadMetrics[i].items_processed > 0 ? 
+                        threadMetrics[i].total_time_ms.load() / threadMetrics[i].items_processed.load() : 0}
+                });
             }
+            
+            json response = {
+                {"total_requests_received", total_requests_received.load()},
+                {"total_metrics_received", total_metrics_received.load()},
+                {"total_metrics_processed", total_metrics_processed.load()},
+                {"total_parse_errors", total_parse_errors.load()},
+                {"current_queue_size", metrics_in_queue.load()},
+                {"max_queue_size_seen", max_queue_size.load()},
+                {"avg_processing_time_ms", total_metrics_processed > 0 ?
+                    total_processing_time_ms.load() / total_metrics_processed.load() : 0},
+                {"thread_stats", thread_stats},
+                {"timestamp", getCurrentTimestamp()}
+            };
+            res.set_content(response.dump(4), "application/json");
         });
         
-        // GET /metrics - Query metriche
-        server_->Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
-            std::string name = req.get_param_value("name");
-            size_t limit = 1000;
-            
-            if (req.has_param("limit")) {
-                try {
-                    limit = std::stoull(req.get_param_value("limit"));
-                } catch (...) {
-                    limit = 1000;
-                }
-            }
-            
-            // Estrai tags dai parametri query
-            std::map<std::string, std::string> tags;
-            for (const auto& [key, value] : req.params) {
-                if (key.find("tag.") == 0) {
-                    tags[key.substr(4)] = value;
-                }
-            }
-            
-            auto metrics = storage_.get_metrics(name, tags, limit);
-            
-            json response = json::array();
-            for (const auto& metric : metrics) {
-                response.push_back(metric.to_json());
-            }
-            
+        // Endpoint per flush forzato della queue
+        srv.Post("/admin/flush", [this](const httplib::Request& req, httplib::Response& res) {
+            queueCV.notify_all();  // Sveglia tutti i worker
+            json response = {
+                {"status", "flushing"},
+                {"queue_size", metrics_in_queue.load()}
+            };
             res.set_content(response.dump(), "application/json");
-        });
-        
-        // GET /metrics/:name/stats - Statistiche per una metrica
-        server_->Get(R"(/metrics/([^/]+)/stats)", [this](const httplib::Request& req, httplib::Response& res) {
-            std::string metric_name = req.matches[1];
-            std::string field_name = req.get_param_value("field");
-            
-            if (field_name.empty()) {
-                json error = {{"error", "Missing required parameter: field"}};
-                res.status = 400;
-                res.set_content(error.dump(), "application/json");
-                return;
-            }
-            
-            auto stats = storage_.get_statistics(metric_name, field_name);
-            res.set_content(stats.dump(), "application/json");
-        });
-        
-        // DELETE /metrics - Pulisci tutte le metriche
-        server_->Delete("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
-            storage_.clear();
-            json response = {{"status", "success"}, {"message", "All metrics cleared"}};
-            res.set_content(response.dump(), "application/json");
-            log("INFO", "All metrics cleared");
-        });
-        
-        // Endpoint per Telegraf output plugin
-        server_->Post("/telegraf", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                // Telegraf invia metriche in formato Line Protocol o JSON
-                // Qui assumiamo formato JSON
-                json data = json::parse(req.body);
-                std::vector<Metric> metrics;
-                
-                // Formato Telegraf JSON
-                if (data.contains("metrics")) {
-                    for (const auto& m : data["metrics"]) {
-                        Metric metric;
-                        metric.name = m["name"];
-                        
-                        if (m.contains("tags")) {
-                            metric.tags = m["tags"].get<std::map<std::string, std::string>>();
-                        }
-                        
-                        if (m.contains("fields")) {
-                            for (const auto& [key, value] : m["fields"].items()) {
-                                if (value.is_number()) {
-                                    metric.fields[key] = value.get<double>();
-                                }
-                            }
-                        }
-                        
-                        if (m.contains("timestamp")) {
-                            metric.timestamp = std::chrono::system_clock::time_point(
-                                std::chrono::seconds(m["timestamp"].get<long>()));
-                        } else {
-                            metric.timestamp = std::chrono::system_clock::now();
-                        }
-                        
-                        metrics.push_back(metric);
-                    }
-                }
-                
-                storage_.add_metrics(metrics);
-                res.status = 204; // No Content - successo per Telegraf
-                
-                log("INFO", "Received " + std::to_string(metrics.size()) + " metrics from Telegraf");
-                
-            } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(e.what(), "text/plain");
-                log("ERROR", "Failed to parse Telegraf data: " + std::string(e.what()));
-            }
         });
     }
     
-public:
-    MetricsRESTServer(const ServerConfig& config) : config_(config) {}
+    void handleMetricsAsync(const httplib::Request& req, httplib::Response& res) {
+        // CRITICO: Questa funzione deve essere VELOCISSIMA
+        // Non fare parsing, validazione o processing qui!
+        
+        auto start_time = steady_clock::now();
+        total_requests_received++;
+        
+        // Controlla dimensione queue (veloce)
+        size_t current_queue_size = metrics_in_queue.load();
+        if (current_queue_size >= QUEUE_MAX_SIZE) {
+            // Queue piena, rifiuta la richiesta
+            json error_response = {
+                {"status", "error"},
+                {"message", "Queue full, server overloaded"},
+                {"queue_size", current_queue_size}
+            };
+            res.status = 503;  // Service Unavailable
+            res.set_content(error_response.dump(), "application/json");
+            return;
+        }
+        
+        // Crea l'item per la queue - SOLO copia della stringa!
+        QueueItem item{
+            req.body,           // Copia il body raw (stringa)
+            req.remote_addr,    // IP del client
+            start_time          // Timestamp
+        };
+        
+        // Aggiungi alla queue (operazione velocissima)
+        {
+            lock_guard<mutex> lock(queueMutex);
+            metricsQueue.push(move(item));  // Move semantics per efficienza
+            current_queue_size = metricsQueue.size();
+            metrics_in_queue = current_queue_size;
+            
+            // Aggiorna max queue size
+            size_t prev_max = max_queue_size.load();
+            while (current_queue_size > prev_max && 
+                   !max_queue_size.compare_exchange_weak(prev_max, current_queue_size));
+        }
+        
+        // Notifica UN worker thread
+        queueCV.notify_one();
+        
+        // Risposta immediata - NON include count perché non abbiamo parsato!
+        json response = {
+            {"status", "accepted"},
+            {"message", "Metrics queued for processing"},
+            {"queue_position", current_queue_size}
+        };
+        
+        res.status = 202;  // HTTP 202 Accepted
+        res.set_content(response.dump(), "application/json");
+        
+        // Tempo di risposta dovrebbe essere < 1ms
+        auto duration = duration_cast<microseconds>(steady_clock::now() - start_time).count();
+        if (duration > 1000) {  // > 1ms
+            cout << "Warning: Slow enqueue time: " << duration << " microseconds" << endl;
+        }
+    }
     
-    bool start() {
-        try {
-            // Crea server HTTPS
-            server_ = std::make_unique<httplib::SSLServer>(
-                config_.cert_file.c_str(), 
-                config_.key_file.c_str()
-            );
-            
-            if (!server_->is_valid()) {
-                log("ERROR", "Failed to initialize SSL server. Check certificate files.");
-                return false;
-            }
-            
-            // Carica certificato CA per validazione
-            if (config_.require_client_cert && !config_.ca_file.empty()) {
-                if (!load_ca_certificate()) {
-                    return false;
-                }
-                
-                SSL_CTX* ctx = server_->ssl_context();
-                
-                // Carica CA file nel contesto SSL
-                if (SSL_CTX_load_verify_locations(ctx, config_.ca_file.c_str(), nullptr) != 1) {
-                    log("ERROR", "Failed to load CA file: " + config_.ca_file);
-                    return false;
-                }
-                
-                // Configura validazione certificati client
-                SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, 
-                                  verify_callback);
-                
-                // Imposta profondità verifica catena certificati
-                SSL_CTX_set_verify_depth(ctx, 5);
-                
-                // Carica CA nel trust store per validazione
-                X509_STORE* store = SSL_CTX_get_cert_store(ctx);
-                if (ca_cert_) {
-                    X509_STORE_add_cert(store, ca_cert_);
-                }
-                
-                log("INFO", "Client certificate validation enabled with CA: " + config_.ca_file);
-            }
-            
-            // Configura compressione gzip se supportata
-            if (config_.enable_compression) {
-                // cpp-httplib supporta automaticamente gzip se compilato con CPPHTTPLIB_ZLIB_SUPPORT
-                log("INFO", "Gzip compression enabled (automatic with CPPHTTPLIB_ZLIB_SUPPORT)");
-            }
-            
-            setup_middleware();
-            setup_endpoints();
-            
-            // Avvia server in thread separato
-            running_ = true;
-            server_thread_ = std::thread([this]() {
-                log("INFO", "Starting HTTPS server on " + config_.host + ":" + std::to_string(config_.port));
-                server_->listen(config_.host.c_str(), config_.port);
+    void startProcessingThreads() {
+        for (size_t i = 0; i < NUM_WORKERS; ++i) {
+            processingThreads.emplace_back([this, i]() {
+                processMetricsWorker(i);
             });
             
-            return true;
+            // Imposta thread affinity (opzionale, per Linux)
+            #ifdef __linux__
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(i % thread::hardware_concurrency(), &cpuset);
+            pthread_setaffinity_np(processingThreads.back().native_handle(), 
+                                  sizeof(cpu_set_t), &cpuset);
+            #endif
+        }
+    }
+    
+    void processMetricsWorker(size_t workerId) {
+        cout << "Worker " << workerId << " started (TID: " << this_thread::get_id() << ")" << endl;
+        
+        // Generator dedicato per questo thread
+        auto& generator = generators[workerId];
+        
+        // Buffer locale per batch processing
+        vector<QueueItem> localBatch;
+        localBatch.reserve(100);
+        
+        while (!shouldStop) {
+            unique_lock<mutex> lock(queueMutex);
             
-        } catch (const std::exception& e) {
-            log("ERROR", "Failed to start server: " + std::string(e.what()));
-            return false;
+            // Aspetta che ci siano metriche o timeout per batch processing
+            auto timeout_point = chrono::steady_clock::now() + chrono::milliseconds(100);
+            queueCV.wait_until(lock, timeout_point, [this]() {
+                return !metricsQueue.empty() || shouldStop;
+            });
+            
+            if (shouldStop && metricsQueue.empty()) break;
+            
+            // Prendi un batch di elementi dalla queue
+            localBatch.clear();
+            const size_t BATCH_SIZE = 50;  // Processa fino a 50 elementi per volta
+            
+            while (!metricsQueue.empty() && localBatch.size() < BATCH_SIZE) {
+                localBatch.push_back(move(metricsQueue.front()));
+                metricsQueue.pop();
+            }
+            metrics_in_queue = metricsQueue.size();
+            
+            lock.unlock();  // IMPORTANTE: Rilascia il lock prima del processing!
+            
+            // Processa il batch locale SENZA lock
+            for (const auto& item : localBatch) {
+                processRawMetrics(workerId, item, *generator);
+            }
+            
+            // Aggiorna statistiche del thread
+            threadMetrics[workerId].items_processed += localBatch.size();
+        }
+        
+        cout << "Worker " << workerId << " stopped. Processed " 
+             << threadMetrics[workerId].items_processed << " items" << endl;
+    }
+    
+    void processRawMetrics(size_t workerId, const QueueItem& item, 
+                           RedisTimeSeriesGenerator& generator) {
+        auto start_time = steady_clock::now();
+        
+        try {
+            // ORA facciamo il parsing JSON (nel worker thread, non nell'handler HTTP!)
+            json data = json::parse(item.raw_data);
+            
+            // Verifica e processa metriche
+            if (data.contains("metrics") && data["metrics"].is_array()) {
+                const auto& metrics = data["metrics"];
+                size_t metrics_count = metrics.size();
+                
+                // Genera comandi Redis
+                auto commands = generator.generateCommands(metrics);
+                
+                // TODO: Invia i comandi a Redis
+                // Per ora solo conteggio
+                total_metrics_processed += metrics_count;
+                total_metrics_received += metrics_count;
+                
+                // Log su file se abilitato (con lock per thread safety)
+                if (enableFileLogging && metrics_file.is_open()) {
+                    json log_entry = {
+                        {"timestamp", getCurrentTimestamp()},
+                        {"worker_id", workerId},
+                        {"source_ip", item.source_ip},
+                        {"metrics_count", metrics_count},
+                        {"queue_delay_ms", duration_cast<milliseconds>(
+                            steady_clock::now() - item.received_time).count()}
+                    };
+                    
+                    lock_guard<mutex> lock(file_mutex);
+                    metrics_file << log_entry.dump() << endl;
+                }
+                
+                // Debug output (disabilita in produzione)
+                if (metrics_count > 0 && workerId == 0) {  // Solo worker 0 per ridurre output
+                    static atomic<size_t> debug_counter{0};
+                    if (++debug_counter % 100 == 0) {  // Ogni 100 batch
+                        cout << "[Worker " << workerId << "] Processed batch: " 
+                             << metrics_count << " metrics, "
+                             << "Queue: " << metrics_in_queue.load() << endl;
+                    }
+                }
+            }
+            
+        } catch (const json::parse_error& e) {
+            // Errore di parsing JSON
+            threadMetrics[workerId].parse_errors++;
+            total_parse_errors++;
+            
+            cerr << "[Worker " << workerId << "] JSON parse error: " << e.what() << endl;
+            
+            // Log dell'errore
+            if (enableFileLogging && metrics_file.is_open()) {
+                json error_log = {
+                    {"timestamp", getCurrentTimestamp()},
+                    {"worker_id", workerId},
+                    {"error", "parse_error"},
+                    {"message", e.what()},
+                    {"data_size", item.raw_data.size()}
+                };
+                
+                lock_guard<mutex> lock(file_mutex);
+                metrics_file << error_log.dump() << endl;
+            }
+        } catch (const exception& e) {
+            cerr << "[Worker " << workerId << "] Processing error: " << e.what() << endl;
+        }
+        
+        // Aggiorna tempo di processing
+        auto duration_ms = duration_cast<milliseconds>(steady_clock::now() - start_time).count();
+        threadMetrics[workerId].total_time_ms += duration_ms;
+        total_processing_time_ms += duration_ms;
+    }
+    
+    void printFinalStats() {
+        cout << "\n=== Final Statistics ===" << endl;
+        cout << "Total requests received: " << total_requests_received << endl;
+        cout << "Total metrics received: " << total_metrics_received << endl;
+        cout << "Total metrics processed: " << total_metrics_processed << endl;
+        cout << "Total parse errors: " << total_parse_errors << endl;
+        cout << "Max queue size reached: " << max_queue_size << endl;
+        cout << "Average processing time: " 
+             << (total_metrics_processed > 0 ? 
+                 total_processing_time_ms.load() / total_metrics_processed.load() : 0) 
+             << " ms" << endl;
+        
+        cout << "\nPer-thread statistics:" << endl;
+        for (size_t i = 0; i < NUM_WORKERS; ++i) {
+            cout << "  Thread " << i << ": " 
+                 << threadMetrics[i].items_processed << " items, "
+                 << threadMetrics[i].parse_errors << " errors" << endl;
         }
     }
     
-    void stop() {
-        if (running_) {
-            running_ = false;
-            if (server_) {
-                server_->stop();
-            }
-            if (server_thread_.joinable()) {
-                server_thread_.join();
-            }
-            log("INFO", "Server stopped");
-        }
+    void runHTTP(const string& host, int port) {
+        cout << "\n=== HTTP Server Configuration ===" << endl;
+        cout << "Address: http://" << host << ":" << port << endl;
+        cout << "Worker threads: " << NUM_WORKERS << endl;
+        cout << "Max queue size: " << QUEUE_MAX_SIZE << endl;
+        cout << "Warning threshold: " << QUEUE_WARNING_THRESHOLD << endl;
+        cout << "==================================\n" << endl;
+        
+        server.listen(host.c_str(), port);
     }
     
-    ~MetricsRESTServer() {
-        stop();
-        if (ca_cert_) {
-            X509_free(ca_cert_);
-        }
+    void runHTTPS(const string& host, int port) {
+        cout << "\n=== HTTPS Server Configuration ===" << endl;
+        cout << "Address: https://" << host << ":" << port << endl;
+        cout << "Worker threads: " << NUM_WORKERS << endl;
+        cout << "Max queue size: " << QUEUE_MAX_SIZE << endl;
+        cout << "Warning threshold: " << QUEUE_WARNING_THRESHOLD << endl;
+        cout << "===================================\n" << endl;
+        
+        ssl_server.listen(host.c_str(), port);
+    }
+    
+private:
+    static string getCurrentTimestamp() {
+        auto now = chrono::system_clock::now();
+        auto time_t = chrono::system_clock::to_time_t(now);
+        
+        stringstream ss;
+        ss << put_time(gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+        return ss.str();
     }
 };
 
-// Funzione per generare certificati self-signed di esempio
-void generate_example_certificates() {
-    std::cout << "Generating example certificates..." << std::endl;
-    
-    // Script per generare certificati di esempio
-    std::string script = R"(#!/bin/bash
-# Genera CA
-openssl genrsa -out ca.key 2048
-openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/C=IT/ST=Lombardy/L=Milan/O=MetricsServer/CN=MetricsCA"
-
-# Genera certificato server
-openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr -subj "/C=IT/ST=Lombardy/L=Milan/O=MetricsServer/CN=localhost"
-openssl x509 -req -days 365 -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt
-
-# Genera certificato client per Telegraf
-openssl genrsa -out client.key 2048
-openssl req -new -key client.key -out client.csr -subj "/C=IT/ST=Lombardy/L=Milan/O=MetricsServer/CN=telegraf-client"
-openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt
-
-echo "Certificates generated successfully!"
-)";
-    
-    std::ofstream script_file("generate_certs.sh");
-    script_file << script;
-    script_file.close();
-    
-    system("chmod +x generate_certs.sh && ./generate_certs.sh");
-}
-
-// Esempio di configurazione Telegraf
-void print_telegraf_config() {
-    std::cout << R"(
-# Esempio di configurazione Telegraf per inviare metriche al server
-
-[[outputs.http]]
-  url = "https://localhost:8443/telegraf"
-  method = "POST"
-  data_format = "json"
-  
-  # Autenticazione TLS
-  tls_ca = "/path/to/ca.crt"
-  tls_cert = "/path/to/client.crt"
-  tls_key = "/path/to/client.key"
-  
-  # Se usi API key
-  # headers = {"Authorization" = "Bearer your-api-key"}
-  
-  # Timeout
-  timeout = "5s"
-  
-  # Batch size
-  metric_batch_size = 1000
-  
-  # Buffer
-  metric_buffer_limit = 10000
-
-# Esempio di input plugin
-[[inputs.cpu]]
-  percpu = true
-  totalcpu = true
-  collect_cpu_time = false
-  report_active = false
-
-[[inputs.mem]]
-  # no configuration
-
-[[inputs.disk]]
-  ignore_fs = ["tmpfs", "devtmpfs", "devfs", "iso9660", "overlay", "aufs", "squashfs"]
-)" << std::endl;
-}
-
 int main(int argc, char* argv[]) {
-    // Configurazione di esempio
-    ServerConfig config;
-    
-    // Parsing argomenti command line
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--host" && i + 1 < argc) {
-            config.host = argv[++i];
-        } else if (arg == "--port" && i + 1 < argc) {
-            config.port = std::stoi(argv[++i]);
-        } else if (arg == "--cert" && i + 1 < argc) {
-            config.cert_file = argv[++i];
-        } else if (arg == "--key" && i + 1 < argc) {
-            config.key_file = argv[++i];
-        } else if (arg == "--ca" && i + 1 < argc) {
-            config.ca_file = argv[++i];
-        } else if (arg == "--api-key" && i + 1 < argc) {
-            config.api_key = argv[++i];
-        } else if (arg == "--no-client-cert") {
-            config.require_client_cert = false;
-        } else if (arg == "--no-compression") {
-            config.enable_compression = false;
-        } else if (arg == "--compression-level" && i + 1 < argc) {
-            config.compression_level = std::stoi(argv[++i]);
-        } else if (arg == "--generate-certs") {
-            generate_example_certificates();
-            return 0;
-        } else if (arg == "--telegraf-config") {
-            print_telegraf_config();
-            return 0;
-        } else if (arg == "--help") {
-            std::cout << "Usage: " << argv[0] << " [options]\n"
-                      << "Options:\n"
-                      << "  --host <address>      Server address (default: 0.0.0.0)\n"
-                      << "  --port <port>         Server port (default: 8443)\n"
-                      << "  --cert <file>         Server certificate file\n"
-                      << "  --key <file>          Server private key file\n"
-                      << "  --ca <file>           CA certificate for client auth\n"
-                      << "  --api-key <key>       API key for additional auth\n"
-                      << "  --no-client-cert      Disable client certificate requirement\n"
-                      << "  --no-compression      Disable gzip compression\n"
-                      << "  --compression-level   Compression level 1-9 (default: 6)\n"
-                      << "  --generate-certs      Generate example certificates\n"
-                      << "  --telegraf-config     Print example Telegraf configuration\n"
-                      << "  --help                Show this help\n";
-            return 0;
+    try {
+        // Ottimizzazioni a livello di sistema
+        #ifdef __linux__
+        // Aumenta la priorità del processo
+        nice(-10);
+        #endif
+        
+        string mode = "https";
+        if (argc > 1) {
+            mode = argv[1];
         }
-    }
-    
-    // Verifica che i certificati esistano
-    std::ifstream cert_check(config.cert_file);
-    std::ifstream key_check(config.key_file);
-    if (!cert_check || !key_check) {
-        std::cerr << "Certificate files not found. Run with --generate-certs to create examples.\n";
+        
+        cout << "Starting Metrics Server v2.0 (Fully Async)" << endl;
+        cout << "CPU cores available: " << thread::hardware_concurrency() << endl;
+        
+        MetricsServer server("server.crt", "server.key");
+        
+        if (mode == "--http-only") {
+            server.runHTTP("0.0.0.0", 8080);
+        } else if (mode == "--https-only") {
+            server.runHTTPS("0.0.0.0", 8443);
+        } else {
+            // Default: prova HTTPS, fallback a HTTP
+            try {
+                server.runHTTPS("0.0.0.0", 8443);
+            } catch (const exception& e) {
+                cerr << "HTTPS failed: " << e.what() << endl;
+                cerr << "Starting HTTP server..." << endl;
+                server.runHTTP("0.0.0.0", 8080);
+            }
+        }
+        
+    } catch (const exception& e) {
+        cerr << "Fatal error: " << e.what() << endl;
         return 1;
     }
-    
-    // Crea e avvia il server
-    MetricsRESTServer server(config);
-    
-    if (!server.start()) {
-        std::cerr << "Failed to start server\n";
-        return 1;
-    }
-    
-    std::cout << "Metrics REST Server started on https://" << config.host << ":" << config.port << "\n";
-    std::cout << "Press Ctrl+C to stop...\n";
-    
-    // Gestione segnali per shutdown pulito
-    std::condition_variable cv;
-    std::mutex cv_m;
-    std::unique_lock<std::mutex> lock(cv_m);
-    
-    std::signal(SIGINT, [](int) {
-        std::cout << "\nShutting down...\n";
-        exit(0);
-    });
-    
-    cv.wait(lock);
     
     return 0;
 }
-
-/* 
-Compilazione:
-g++ -std=c++20 -o metrics_server metrics_server.cpp -lssl -lcrypto -pthread -lz
-
-Dipendenze da installare:
-- cpp-httplib: https://github.com/yhirose/cpp-httplib
-- nlohmann/json: https://github.com/nlohmann/json
-
-Su Ubuntu/Debian:
-sudo apt-get install libssl-dev zlib1g-dev
-sudo apt-get install nlohmann-json3-dev
-
-Per cpp-httplib, scarica il singolo header:
-wget https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h
-
-Esempio di utilizzo:
-1. Genera certificati: ./metrics_server --generate-certs
-2. Avvia server: ./metrics_server --api-key mysecretkey
-3. Configura Telegraf: ./metrics_server --telegraf-config > telegraf.conf
-4. Test con curl:
-   curl -k -X POST https://localhost:8443/metrics \
-        -H "Authorization: Bearer mysecretkey" \
-        -H "Content-Type: application/json" \
-        -H "Accept-Encoding: gzip" \
-        -d '[{"name":"cpu_usage","tags":{"host":"server1"},"fields":{"usage":45.5}}]'
-
-5. Streaming real-time:
-   curl -k -H "Authorization: Bearer mysecretkey" \
-        https://localhost:8443/stream?metrics=cpu_usage,memory&tag.host=server1
-
-6. Test compressione:
-   curl -k -X GET https://localhost:8443/metrics \
-        -H "Authorization: Bearer mysecretkey" \
-        -H "Accept-Encoding: gzip" \
-        --compressed
-*/
