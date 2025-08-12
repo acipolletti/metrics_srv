@@ -1,163 +1,114 @@
-# Makefile per Server Metriche C++20
+# Makefile for Parquet Metrics Writer Testing
+# Usage: make [target]
 
-# Compilatore e flags
-CXX := g++
-CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic
-DEFINES := -DCPPHTTPLIB_OPENSSL_SUPPORT -DCPPHTTPLIB_ZLIB_SUPPORT -DCPPHTTPLIB_THREAD_POOL_COUNT=16
-LDFLAGS := -lssl -lcrypto -pthread -lz
+CXX = g++
+CXXFLAGS = -std=c++20 -Wall -Wextra -O3 -march=native -pthread
+INCLUDES = -I. -I/usr/local/include
+LDFLAGS = -L/usr/local/lib
+LIBS = -larrow -lparquet -lpthread -lssl -lcrypto
 
-# Modalità di build (release di default)
-BUILD_MODE ?= release
+# Target executables
+TARGETS = test_parquet metrics_server_parquet
 
-ifeq ($(BUILD_MODE),debug)
-    CXXFLAGS += -g -O0 -DDEBUG
-else
-    CXXFLAGS += -O3 -DNDEBUG
-endif
+# Default target
+all: $(TARGETS)
 
-# File sorgenti e target
-SERVER_SRC := metrics_server.cpp
-CLIENT_SRC := test_client.cpp
-SSL_CLIENT_SRC := simple_ssl_client.cpp
-SERVER_BIN := metrics_server
-CLIENT_BIN := test_client
-SSL_CLIENT_BIN := simple_ssl_client
+# Test program for ParquetMetricsWriter
+test_parquet: example_parquet_integration.cpp ParquetMetricsWriter.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ example_parquet_integration.cpp $(LDFLAGS) $(LIBS)
+	@echo "Built: $@"
+	@echo "Run with: ./$@"
 
-# Regole
-.PHONY: all clean server client test certs run help
+# Full metrics server with Parquet support
+metrics_server_parquet: metrics_server.cpp ParquetMetricsWriter.hpp TelegrafToRedisTS.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -DENABLE_PARQUET_STORAGE -o $@ metrics_server.cpp $(LDFLAGS) $(LIBS) -lhttplib
+	@echo "Built: $@"
+	@echo "Run with: ./$@ [--http-only|--https-only]"
 
-# Build di default
-all: server client ssl-client
+# Quick test - compile and run
+test: test_parquet
+	@echo "\n=== Running Parquet Tests ==="
+	./test_parquet
 
-# Server principale
-server: $(SERVER_BIN)
+# Benchmark
+benchmark: test_parquet
+	@echo "\n=== Running Performance Benchmark ==="
+	time ./test_parquet
 
-$(SERVER_BIN): $(SERVER_SRC) httplib.h
-	@echo "🔨 Building server ($(BUILD_MODE) mode)..."
-	$(CXX) $(CXXFLAGS) $(DEFINES) -o $@ $< $(LDFLAGS)
-	@echo "✅ Server built successfully!"
+# Check dependencies
+check-deps:
+	@echo "Checking dependencies..."
+	@command -v pkg-config >/dev/null 2>&1 || { echo "pkg-config not found"; exit 1; }
+	@pkg-config --exists arrow || { echo "Apache Arrow not found"; exit 1; }
+	@pkg-config --exists parquet || { echo "Apache Parquet not found"; exit 1; }
+	@echo "All dependencies found!"
+	@echo "Arrow version: $$(pkg-config --modversion arrow)"
+	@echo "Parquet version: $$(pkg-config --modversion parquet)"
 
-# Client di test
-client: $(CLIENT_BIN)
+# Install Arrow/Parquet (Ubuntu/Debian)
+install-arrow:
+	@echo "Installing Apache Arrow and Parquet..."
+	wget -qO- https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest.deb | sudo apt install -y
+	sudo apt update
+	sudo apt install -y libarrow-dev libparquet-dev libarrow-dataset-dev
 
-$(CLIENT_BIN): $(CLIENT_SRC) httplib.h
-	@echo "🔨 Building test client..."
-	$(CXX) $(CXXFLAGS) $(DEFINES) -o $@ $< $(LDFLAGS)
-	@echo "✅ Test client built successfully!"
+# Create test data
+test-data:
+	@echo "Creating test metrics data..."
+	@mkdir -p metrics_data
+	@echo '{"metrics":[{"name":"cpu","timestamp":1700000000,"value":50.5,"tags":{"host":"test"}}]}' > test_metrics.json
 
-# SSL Client semplice
-ssl-client: $(SSL_CLIENT_BIN)
-
-$(SSL_CLIENT_BIN): $(SSL_CLIENT_SRC)
-	@echo "🔨 Building simple SSL client..."
-	@if [ -f $(SSL_CLIENT_SRC) ]; then \
-		$(CXX) $(CXXFLAGS) -o $@ $< -lssl -lcrypto; \
-		echo "✅ SSL client built successfully!"; \
-	else \
-		echo "⚠️  $(SSL_CLIENT_SRC) not found, skipping"; \
-	fi
-
-# Scarica cpp-httplib se non presente
-httplib.h:
-	@echo "📥 Downloading cpp-httplib..."
-	@wget -q https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h
-	@echo "✅ cpp-httplib downloaded!"
-
-# Genera certificati
-certs:
-	@echo "🔐 Generating certificates..."
-	@chmod +x generate_certs.sh
-	@./generate_certs.sh
-	@echo "✅ Certificates generated!"
-
-# Esegui il server
-run: server certs
-	@echo "🚀 Starting server..."
-	./$(SERVER_BIN) --api-key development-key
-
-# Test base
-test: all
-	@echo "🧪 Running basic tests..."
-	@if [ -x ./$(CLIENT_BIN) ]; then \
-		./$(CLIENT_BIN) --test --api-key development-key; \
-	else \
-		echo "⚠️  Test client non disponibile, usa test-curl invece"; \
-	fi
-
-# Test con curl (più affidabile per certificati client)
-test-curl: certs
-	@echo "🧪 Running tests with cURL..."
-	@chmod +x test_with_curl.sh
-	@API_KEY=development-key ./test_with_curl.sh
-
-# Test con SSL client
-test-ssl: ssl-client certs
-	@echo "🧪 Running tests with SSL client..."
-	@if [ -x ./$(SSL_CLIENT_BIN) ]; then \
-		./$(SSL_CLIENT_BIN) --api-key development-key; \
-	else \
-		echo "⚠️  SSL client not available"; \
-	fi
-
-# Test streaming
-test-streaming: all
-	@echo "🌊 Testing streaming..."
-	./$(CLIENT_BIN) --streaming 10 --api-key development-key --no-verify-ssl
-
-# Test compressione
-test-compression: all
-	@echo "📦 Testing compression..."
-	./$(CLIENT_BIN) --compression --api-key development-key --no-verify-ssl
-
-# Pulizia
+# Clean build artifacts
 clean:
-	@echo "🧹 Cleaning..."
-	@rm -f $(SERVER_BIN) $(CLIENT_BIN) $(SSL_CLIENT_BIN)
-	@rm -f *.o *.log
-	@echo "✅ Cleaned!"
+	rm -f $(TARGETS)
+	rm -f *.o
+
+# Clean all data
+clean-all: clean
+	rm -rf metrics_data/
+	rm -rf production_metrics/
+	rm -f *.parquet
+	rm -f metrics.jsonl
+
+# View Parquet files with parquet-tools
+view-parquet:
+	@if command -v parquet-tools >/dev/null 2>&1; then \
+		find metrics_data -name "*.parquet" -exec echo "File: {}" \; -exec parquet-tools show {} \; | head -50; \
+	else \
+		echo "parquet-tools not installed. Install with: pip install parquet-tools"; \
+	fi
+
+# Statistics
+stats:
+	@echo "\n=== Parquet Storage Statistics ==="
+	@echo "Number of files: $$(find metrics_data -name "*.parquet" 2>/dev/null | wc -l)"
+	@echo "Total size: $$(du -sh metrics_data 2>/dev/null | cut -f1)"
+	@echo "Latest file: $$(ls -t metrics_data/**/*.parquet 2>/dev/null | head -1)"
+	@if [ -f "$$(ls -t metrics_data/**/*.parquet 2>/dev/null | head -1)" ]; then \
+		echo "Latest file size: $$(ls -lh $$(ls -t metrics_data/**/*.parquet 2>/dev/null | head -1) | awk '{print $$5}')"; \
+	fi
 
 # Help
 help:
-	@echo "📚 Makefile per Server Metriche C++20"
+	@echo "Parquet Metrics Writer - Makefile Targets"
 	@echo ""
-	@echo "Targets disponibili:"
-	@echo "  make all              - Compila server e client"
-	@echo "  make server           - Compila solo il server"
-	@echo "  make client           - Compila solo il client"
-	@echo "  make ssl-client       - Compila client SSL semplice"
-	@echo "  make certs            - Genera certificati SSL"
-	@echo "  make run              - Avvia il server"
-	@echo "  make test             - Esegui test di base"
-	@echo "  make test-curl        - Test completi con cURL"
-	@echo "  make test-ssl         - Test con SSL client"
-	@echo "  make test-streaming   - Test streaming SSE"
-	@echo "  make test-compression - Test compressione gzip"
-	@echo "  make clean            - Pulisci file compilati"
+	@echo "Build targets:"
+	@echo "  make all              - Build all targets"
+	@echo "  make test_parquet     - Build test program"
+	@echo "  make metrics_server_parquet - Build full server"
 	@echo ""
-	@echo "Opzioni:"
-	@echo "  BUILD_MODE=debug      - Compila in modalità debug"
-	@echo "  BUILD_MODE=release    - Compila in modalità release (default)"
+	@echo "Test targets:"
+	@echo "  make test            - Run tests"
+	@echo "  make benchmark       - Run performance benchmark"
+	@echo "  make test-data       - Create test data"
 	@echo ""
-	@echo "Esempi:"
-	@echo "  make BUILD_MODE=debug"
-	@echo "  make server BUILD_MODE=release"
-	@echo "  make test-curl"
+	@echo "Utility targets:"
+	@echo "  make check-deps      - Check dependencies"
+	@echo "  make install-arrow   - Install Arrow/Parquet libraries"
+	@echo "  make view-parquet    - View Parquet files content"
+	@echo "  make stats           - Show storage statistics"
+	@echo "  make clean           - Clean build artifacts"
+	@echo "  make clean-all       - Clean everything including data"
+	@echo "  make help            - Show this help"
 
-# Installazione dipendenze (richiede sudo)
-install-deps:
-	@echo "📦 Installing dependencies..."
-	@if command -v apt-get >/dev/null 2>&1; then \
-		sudo apt-get update && \
-		sudo apt-get install -y g++ libssl-dev zlib1g-dev nlohmann-json3-dev; \
-	elif command -v yum >/dev/null 2>&1; then \
-		sudo yum install -y gcc-c++ openssl-devel zlib-devel; \
-	elif command -v brew >/dev/null 2>&1; then \
-		brew install openssl zlib nlohmann-json; \
-	else \
-		echo "❌ Package manager non supportato. Installa manualmente:"; \
-		echo "   - g++ (C++20)"; \
-		echo "   - OpenSSL dev"; \
-		echo "   - zlib dev"; \
-		echo "   - nlohmann/json"; \
-	fi
-	@echo "✅ Dependencies installed!"
+.PHONY: all test benchmark check-deps install-arrow test-data clean clean-all view-parquet stats help

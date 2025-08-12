@@ -1,13 +1,15 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.16)
 project(metrics_server)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Abilita interprocedural optimization (LTO) per Release
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+# Build options
+option(ENABLE_PARQUET "Enable Parquet storage backend" ON)
+option(ENABLE_REDIS "Enable Redis TimeSeries backend" ON)
+option(BUILD_OPTIMIZED "Enable aggressive optimizations" ON)
 
-# FetchContent per scaricare le dipendenze
+# FetchContent for dependencies
 include(FetchContent)
 
 # cpp-httplib
@@ -26,14 +28,44 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(httplib json)
 
-# Trova OpenSSL
+# Find required packages
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
-# Eseguibile principale
-add_executable(metrics_server metrics_server.cpp)
+# Arrow and Parquet (if enabled)
+if(ENABLE_PARQUET)
+    find_package(Arrow REQUIRED)
+    find_package(Parquet REQUIRED)
+    
+    if(NOT Arrow_FOUND OR NOT Parquet_FOUND)
+        message(STATUS "Arrow/Parquet not found via find_package, trying FetchContent...")
+        
+        FetchContent_Declare(
+            arrow
+            GIT_REPOSITORY https://github.com/apache/arrow.git
+            GIT_TAG apache-arrow-14.0.0
+            GIT_SHALLOW TRUE
+        )
+        
+        set(ARROW_BUILD_STATIC ON)
+        set(ARROW_BUILD_SHARED OFF)
+        set(ARROW_PARQUET ON)
+        set(ARROW_WITH_SNAPPY ON)
+        set(ARROW_WITH_ZLIB ON)
+        set(ARROW_WITH_LZ4 ON)
+        set(ARROW_COMPUTE ON)
+        set(ARROW_FILESYSTEM ON)
+        
+        FetchContent_MakeAvailable(arrow)
+    endif()
+endif()
 
-# Link delle librerie
+# Main executable
+add_executable(metrics_server 
+    metrics_server.cpp
+)
+
+# Base libraries
 target_link_libraries(metrics_server 
     PRIVATE 
         httplib::httplib
@@ -43,159 +75,107 @@ target_link_libraries(metrics_server
         Threads::Threads
 )
 
+# Add Parquet support if enabled
+if(ENABLE_PARQUET)
+    target_compile_definitions(metrics_server PRIVATE ENABLE_PARQUET_STORAGE)
+    
+    if(TARGET Arrow::arrow_shared)
+        target_link_libraries(metrics_server PRIVATE 
+            Arrow::arrow_shared
+            Parquet::parquet_shared
+        )
+    else()
+        target_link_libraries(metrics_server PRIVATE 
+            arrow_static
+            parquet_static
+        )
+    endif()
+    
+    message(STATUS "Parquet storage backend: ENABLED")
+else()
+    message(STATUS "Parquet storage backend: DISABLED")
+endif()
+
 # Include directories
 target_include_directories(metrics_server 
     PRIVATE 
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# Definisci CPPHTTPLIB_OPENSSL_SUPPORT per abilitare HTTPS
+# Enable HTTPS support
 target_compile_definitions(metrics_server PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 
-# ============================================================================
-# OTTIMIZZAZIONI DI COMPILAZIONE
-# ============================================================================
-
-# Opzioni di compilazione per Release (MASSIME PRESTAZIONI)
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    # Ottimizzazioni aggressive
+# Optimization flags
+if(BUILD_OPTIMIZED AND CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(metrics_server PRIVATE 
-        -O3                      # Massimo livello di ottimizzazione
-        -march=native            # Ottimizza per l'architettura CPU corrente
-        -mtune=native            # Fine-tuning per la CPU corrente
-        -flto                    # Link Time Optimization
-        -funroll-loops           # Srotola i loop per performance
-        -ffast-math              # Ottimizzazioni matematiche aggressive
-        -fprefetch-loop-arrays   # Prefetch degli array nei loop
-        -ftree-vectorize         # Auto-vectorization
-        -pthread                 # Supporto threading ottimizzato
+        -O3
+        -march=native
+        -mtune=native
+        -flto
+        -funroll-loops
+        -ffast-math
+        -fprefetch-loop-arrays
+        -ftree-vectorize
+        -pthread
     )
     
-    # Ottimizzazioni specifiche per GCC
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(metrics_server PRIVATE
-            -fipa-pta               # Interprocedural pointer analysis
-            -fdevirtualize-at-ltrans # Devirtualizzazione aggressiva
-            -floop-parallelize-all  # Parallelizzazione automatica loop
-            -ftree-parallelize-loops=4 # Usa 4 thread per parallelizzazione
-        )
-    endif()
-    
-    # Link options per performance
     target_link_options(metrics_server PRIVATE
-        -flto                    # Link Time Optimization
-        -O3                      # Ottimizzazione anche nel linking
-        -pthread                 # Threading ottimizzato
-        -Wl,--gc-sections        # Rimuovi sezioni non usate
+        -flto
+        -O3
+        -pthread
+        -Wl,--gc-sections
     )
     
-    # Definizioni per Release
-    target_compile_definitions(metrics_server PRIVATE
-        NDEBUG                   # Disabilita assert
-        BOOST_DISABLE_ASSERTS    # Disabilita assert di Boost se usato
-    )
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    
+    message(STATUS "Optimizations: ENABLED (O3, native arch, LTO)")
 endif()
 
-# Opzioni di compilazione per Debug
+# Debug flags
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(metrics_server PRIVATE 
-        -g                       # Simboli di debug
-        -O0                      # Nessuna ottimizzazione
-        -Wall                    # Tutti i warning
-        -Wextra                  # Warning extra
-        -Wpedantic               # Aderenza stretta allo standard
-        -Wformat=2               # Controlli format string
-        -Wnull-dereference       # Controllo null pointer
-        -Wdouble-promotion       # Warning su promozioni float->double
-        -Wshadow                 # Warning su variable shadowing
-        -fstack-protector-strong # Protezione stack
-        -fsanitize=address       # AddressSanitizer per debug memoria
-        -fsanitize=undefined     # UndefinedBehaviorSanitizer
+        -g
+        -O0
+        -Wall
+        -Wextra
+        -fsanitize=address
+        -fsanitize=undefined
     )
     
     target_link_options(metrics_server PRIVATE
         -fsanitize=address
         -fsanitize=undefined
     )
-    
-    target_compile_definitions(metrics_server PRIVATE
-        DEBUG
-        _DEBUG
-    )
 endif()
 
-# Build type Profile (per profiling con simboli ma ottimizzato)
-if(CMAKE_BUILD_TYPE STREQUAL "Profile")
-    target_compile_options(metrics_server PRIVATE
-        -O3
-        -g
-        -fno-omit-frame-pointer  # Mantieni frame pointer per profiling
-        -march=native
-        -mtune=native
-    )
-endif()
-
-# ============================================================================
-# CONFIGURAZIONI ADDIZIONALI
-# ============================================================================
-
-# Abilita color output per compilatori che lo supportano
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_compile_options(metrics_server PRIVATE -fdiagnostics-color=always)
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(metrics_server PRIVATE -fcolor-diagnostics)
-endif()
-
-# Statistiche di compilazione
-option(ENABLE_BUILD_STATS "Show build statistics" OFF)
-if(ENABLE_BUILD_STATS)
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(metrics_server PRIVATE -ftime-report)
-    endif()
-endif()
-
-# ============================================================================
-# SUPPORTO PER CPU SPECIFICHE (opzionale, decommentare se necessario)
-# ============================================================================
-
-# # Per CPU Intel con AVX2
-# option(ENABLE_AVX2 "Enable AVX2 instructions" OFF)
-# if(ENABLE_AVX2)
-#     target_compile_options(metrics_server PRIVATE -mavx2 -mfma)
-# endif()
-
-# # Per CPU Intel con AVX-512
-# option(ENABLE_AVX512 "Enable AVX-512 instructions" OFF)
-# if(ENABLE_AVX512)
-#     target_compile_options(metrics_server PRIVATE -mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl)
-# endif()
-
-# ============================================================================
-# STAMPA CONFIGURAZIONE
-# ============================================================================
-
+# Installation instructions for Arrow/Parquet
 message(STATUS "")
-message(STATUS "=== Metrics Server Build Configuration ===")
+message(STATUS "=== Build Configuration ===")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "C++ Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-message(STATUS "C++ Standard: ${CMAKE_CXX_STANDARD}")
-
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    message(STATUS "Optimizations: ENABLED (O3, native arch, LTO)")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    message(STATUS "Debug mode: ENABLED (with sanitizers)")
-elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    message(STATUS "Release with Debug Info: ENABLED")
-elseif(CMAKE_BUILD_TYPE STREQUAL "Profile")
-    message(STATUS "Profile mode: ENABLED")
-endif()
-
-message(STATUS "==========================================")
+message(STATUS "Parquet storage: ${ENABLE_PARQUET}")
+message(STATUS "Redis backend: ${ENABLE_REDIS}")
+message(STATUS "Optimizations: ${BUILD_OPTIMIZED}")
 message(STATUS "")
 
-# Copia script di generazione certificati
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/generate_certs.sh
-    ${CMAKE_CURRENT_BINARY_DIR}/generate_certs.sh
-    COPYONLY
-)
+if(ENABLE_PARQUET AND NOT Arrow_FOUND)
+    message(STATUS "To install Arrow and Parquet on Ubuntu/Debian:")
+    message(STATUS "  sudo apt install libarrow-dev libparquet-dev")
+    message(STATUS "")
+    message(STATUS "Or with conda:")
+    message(STATUS "  conda install arrow-cpp parquet-cpp -c conda-forge")
+    message(STATUS "")
+endif()
+
+# Create Python requirements file for analytics
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/requirements.txt 
+"# Python requirements for Parquet analytics
+duckdb>=0.9.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+matplotlib>=3.5.0
+seaborn>=0.12.0
+jupyterlab>=4.0.0
+")
+
+message(STATUS "Python analytics requirements saved to: ${CMAKE_CURRENT_BINARY_DIR}/requirements.txt")
+message(STATUS "Install with: pip install -r requirements.txt")
