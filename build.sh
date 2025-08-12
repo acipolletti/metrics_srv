@@ -271,4 +271,4 @@ esac
 
 echo ""
 echo "======================================"
-cp /home/ac/app/metrics_srv/src/build/metrics_server .
+cp /home/ac/app/metrics_srv/src/build/metrics_server /home/ac/app/metrics_srv/src/metrics_server

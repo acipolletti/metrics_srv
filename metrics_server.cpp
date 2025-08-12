@@ -9,6 +9,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include "CSVMetricsWriter.hpp"
 
 using json = nlohmann::json;
 using namespace std;
@@ -20,6 +21,7 @@ private:
     
     // Storage backends
     unique_ptr<ParquetMetricsWriter> parquet_writer;
+    unique_ptr<CSVMetricsWriter> csv_writer;
     vector<unique_ptr<RedisTimeSeriesGenerator>> redis_generators;
     
     // Processing queue
@@ -52,11 +54,11 @@ private:
     } config;
 
 public:
-    MetricsServerWithStorage(const string& cert_file, const string& key_file)
+    MetricsServerWithStorage(const string& cert_file, const string& key_file,const std::string mode)
         : ssl_server(cert_file.c_str(), key_file.c_str()) {
         
         // Initialize Parquet writer
-        if (config.enable_parquet) {
+        if (mode == "parquet") {
             ParquetMetricsWriter::Config parquet_config;
             parquet_config.base_path = config.parquet_base_path;
             parquet_config.batch_size = 5000;
@@ -67,6 +69,10 @@ public:
             
             parquet_writer = make_unique<ParquetMetricsWriter>(parquet_config);
             cout << "Parquet storage enabled at: " << parquet_config.base_path << endl;
+        }
+        else if (mode == "csv") {
+            csv_writer = make_unique<CSVMetricsWriter>();
+            cout << "CSV storage enabled at: ./metrics_data " <<  endl;
         }
         
         // Initialize Redis generators (one per worker)
@@ -279,6 +285,10 @@ void handleQuery(const httplib::Request& req, httplib::Response& res) {
                             auto commands = redis_gen->generateCommands(data["metrics"]);
                             // TODO: Execute Redis commands
                         }
+                        
+                        if (csv_writer) {
+                                csv_writer->addMetrics(data);
+                        }
                     }
                 } catch (const exception& e) {
                     cerr << "Worker " << id << " error: " << e.what() << endl;
@@ -309,7 +319,7 @@ void handleQuery(const httplib::Request& req, httplib::Response& res) {
 
 int main(int argc, char* argv[]) {
     try {
-        MetricsServerWithStorage server("server.crt", "server.key");
+        MetricsServerWithStorage server("server.crt", "server.key","csv");
         
         bool use_https = true;
         if (argc > 1 && string(argv[1]) == "--http-only") {
